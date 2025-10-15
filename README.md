@@ -28,7 +28,7 @@ use the implementations provided here, please **also** cite this repository as
   author={Ranocha, Hendrik and Ketcheson, David I},
   year={2025},
   howpublished={\url{https://github.com/ranocha/2025_nls}},
-  doi={TODO}
+  doi={10.5281/zenodo.17361026}
 }
 ```
 
