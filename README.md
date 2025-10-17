@@ -12,7 +12,7 @@ in the article
   author={Ranocha, Hendrik and Ketcheson, David I},
   year={2025},
   month={10},
-  eprint={TODO},
+  eprint={2510.14335},
   eprinttype={arxiv},
   eprintclass={math.NA}
 }
