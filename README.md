@@ -34,7 +34,7 @@ use the implementations provided here, please **also** cite this repository as
 
 ## Abstract
 
-We propose a class of numerical methods for the nonlinear Schrödinger (NLS) equation that conserves mass and energy, is of arbitrarily high-order accuracy in space and time, and requires only the solution of a scalar algebraic equation per time step.  We show that some existing spatial discretizations, including the popular Fourier spectral method, are in fact energy-conserving if one considers the appropriate form of the energy density. We develop a new relaxation-type approach for conserving multiple nonlinear functionals that is more efficient and robust for the NLS equation compared to the existing multiple-relaxation approach. The accuracy and efficiency of the new schemes is demonstrated on test problems for both the focusing and defocusing NLS.
+We propose a class of numerical methods for the nonlinear Schrödinger (NLS) equation that conserves mass and energy, is of arbitrarily high-order accuracy in space and time, and requires only the solution of a nonlinear scalar algebraic equation per time step.  We show that some existing spatial discretizations, including the popular Fourier spectral method, are in fact energy-conserving if one considers the appropriate form of the energy density. We develop a new relaxation-type approach for conserving multiple nonlinear functionals that is more efficient and robust for the NLS equation compared to the existing multiple-relaxation approach. The accuracy and efficiency of the new schemes is demonstrated on test problems for both the focusing and defocusing NLS.
 
 
 ## Numerical experiments
