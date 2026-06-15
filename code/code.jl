@@ -602,6 +602,286 @@ function solve_imex(rhs_stiff!, rhs_stiff_operator, rhs_nonstiff!,
     end
 end
 
+# Strang splitting solver with exact evolution operators
+function solve_strang(evolution1!, evolution2!,
+                      q0, tspan, parameters;
+                      dt,
+                      relaxation::AbstractProjection = NoProjection(),
+                      relaxation_alg = SimpleKlement(),
+                      callback = Returns(nothing),
+                      save_everystep = false)
+    q = copy(q0) # solution
+    if save_everystep
+        sol_q = [copy(q0)]
+        sol_t = [first(tspan)]
+    end
+    tmp1 = similar(q) # temporary update
+    tmp2 = similar(q) # temporary update
+    tmp3 = similar(q) # temporary update
+    t = first(tspan)
+
+    # used for relaxation
+    mass_old = mass(q, parameters)
+    energy_old = energy(q, parameters)
+
+    while t < last(tspan)
+        dt = min(dt, last(tspan) - t)
+
+        # Strang splitting
+        evolution1!(tmp1, q, parameters.equation, parameters, dt / 2)
+        evolution2!(tmp2, tmp1, parameters.equation, parameters, dt)
+        evolution1!(tmp3, tmp2, parameters.equation, parameters, dt / 2)
+
+        # Optionally use relaxation
+        @. tmp1 = (tmp3 - q) / dt
+        t = relaxation!(q, tmp1, tmp2, tmp3, t, dt,
+                        parameters.equation, parameters,
+                        relaxation, relaxation_alg,
+                        mass_old, energy_old)
+
+        if save_everystep
+            push!(sol_q, copy(q))
+            append!(sol_t, t)
+        end
+        callback(q, parameters, t)
+
+        if any(isnan, q)
+            @error "NaNs in solution at time $t" q @__LINE__
+            error()
+        end
+    end
+
+    if save_everystep
+        return (; u = sol_q,
+                  t = sol_t)
+    else
+        return (; u = (q0, q),
+                  t = (first(tspan), t))
+    end
+end
+
+# Exponential method of Bao and C. Wang (2024)
+# An explicit and symmetric exponential wave integrator for the nonlinear
+# Schrödinger equation with low regularity potential and nonlinearity.
+# DOI: 10.1137/23M1615656
+function solve_exponential(q0, tspan, parameters;
+                           dt,
+                           callback = Returns(nothing),
+                           save_everystep = false)
+    equation = parameters.equation
+    if !(equation isa CubicNLS)
+        error("solve_exponential is only implemented for CubicNLS, got $(typeof(equation))")
+    end
+
+    D2 = parameters.D2
+    if !(D2 isa FourierPolynomialDerivativeOperator)
+        error("solve_exponential is only implemented for a Fourier discretization, got $(typeof(D2))")
+    end
+    if !(dt > 0)
+        error("solve_exponential requires a positive time step size, got dt = $dt")
+    end
+
+    q_prev = copy(q0)
+    q = copy(q0)
+    q_next = similar(q0)
+    nonlinear = similar(q0)
+
+    (; tmp) = D2.D1
+    vhat = similar(tmp)
+    what = similar(tmp)
+    bvhat = similar(tmp)
+    bwhat = similar(tmp)
+    scratch = (; nonlinear, vhat, what, bvhat, bwhat)
+
+    t0 = first(tspan)
+    t_end = last(tspan)
+    t = t0
+    if save_everystep
+        sol_q = [copy(q0)]
+        sol_t = [t0]
+    end
+
+    if t < t_end
+        # Initialize the two-step sEWI with the first-order EWI from (2.13).
+        dt_step = min(dt, t_end - t)
+        exponential_first_step!(q, q_prev, scratch, equation, parameters, dt_step)
+        t += dt_step
+
+        if save_everystep
+            push!(sol_q, copy(q))
+            push!(sol_t, t)
+        end
+        callback(q, parameters, t)
+
+        if any(isnan, q)
+            @error "NaNs in solution at time $t" q @__LINE__
+            error()
+        end
+    end
+
+    while t < t_end
+        dt_step = min(dt, t_end - t)
+
+        if dt_step == dt
+            exponential_two_step!(q_next, q, q_prev, scratch,
+                                  equation, parameters, dt_step)
+        else
+            # The symmetric recurrence assumes a constant step size. For a final
+            # shortened interval, restart with the one-step EWI.
+            exponential_first_step!(q_next, q, scratch,
+                                    equation, parameters, dt_step)
+        end
+
+        q_prev, q, q_next = q, q_next, q_prev
+        t += dt_step
+
+        if save_everystep
+            push!(sol_q, copy(q))
+            push!(sol_t, t)
+        end
+        callback(q, parameters, t)
+
+        if any(isnan, q)
+            @error "NaNs in solution at time $t" q @__LINE__
+            error()
+        end
+    end
+
+    if save_everystep
+        return (; u = sol_q,
+                  t = sol_t)
+    else
+        return (; u = (q0, q),
+                  t = (t0, t))
+    end
+end
+
+function exponential_nonlinearity!(nonlinear, q, equation)
+    N = length(q) ÷ 2
+
+    v = view(q, (0 * N + 1):(1 * N))
+    w = view(q, (1 * N + 1):(2 * N))
+    bv = view(nonlinear, (0 * N + 1):(1 * N))
+    bw = view(nonlinear, (1 * N + 1):(2 * N))
+
+    # In the notation of Bao and Wang, B(u) enters the equation as
+    # u_t = i Delta u - i B(u).  For the focusing CubicNLS used here,
+    # i u_t + u_xx + beta |u|^2 u = 0, hence B(u) = -beta |u|^2 u.
+    beta = equation.β
+    @inbounds for i in eachindex(v, w, bv, bw)
+        factor = -beta * (v[i]^2 + w[i]^2)
+        bv[i] = factor * v[i]
+        bw[i] = factor * w[i]
+    end
+
+    return nothing
+end
+
+function exponential_first_step!(qnew, q, scratch,
+                                 equation, parameters, dt)
+    (; D2) = parameters
+    N = size(D2, 2)
+
+    v = view(q, (0 * N + 1):(1 * N))
+    w = view(q, (1 * N + 1):(2 * N))
+    vnew = view(qnew, (0 * N + 1):(1 * N))
+    wnew = view(qnew, (1 * N + 1):(2 * N))
+
+    (; jac, rfft_plan, brfft_plan) = D2.D1
+    (; nonlinear, vhat, what, bvhat, bwhat) = scratch
+    k1 = jac * N
+
+    exponential_nonlinearity!(nonlinear, q, equation)
+    bv = view(nonlinear, (0 * N + 1):(1 * N))
+    bw = view(nonlinear, (1 * N + 1):(2 * N))
+
+    mul!(vhat, rfft_plan, v)
+    mul!(what, rfft_plan, w)
+    mul!(bvhat, rfft_plan, bv)
+    mul!(bwhat, rfft_plan, bw)
+
+    @inbounds for j in eachindex(vhat, what, bvhat, bwhat)
+        theta = ((j - 1) * k1)^2 * dt
+        s, c = sincos(theta)
+
+        vh = vhat[j]
+        wh = what[j]
+        bvh = bvhat[j]
+        bwh = bwhat[j]
+
+        linear_v = c * vh + s * wh
+        linear_w = c * wh - s * vh
+
+        if iszero(theta)
+            phi1_re = zero(theta)
+            phi1_im = -dt
+        else
+            # -i dt phi_1(-i theta) = dt (exp(-i theta) - 1) / theta
+            phi1_re = dt * (c - 1) / theta
+            phi1_im = -dt * s / theta
+        end
+
+        vhat[j] = (linear_v + phi1_re * bvh - phi1_im * bwh) / N
+        what[j] = (linear_w + phi1_re * bwh + phi1_im * bvh) / N
+    end
+
+    mul!(vnew, brfft_plan, vhat)
+    mul!(wnew, brfft_plan, what)
+
+    return nothing
+end
+
+function exponential_two_step!(qnew, q, qold, scratch,
+                               equation, parameters, dt)
+    (; D2) = parameters
+    N = size(D2, 2)
+
+    vold = view(qold, (0 * N + 1):(1 * N))
+    wold = view(qold, (1 * N + 1):(2 * N))
+    vnew = view(qnew, (0 * N + 1):(1 * N))
+    wnew = view(qnew, (1 * N + 1):(2 * N))
+
+    (; jac, rfft_plan, brfft_plan) = D2.D1
+    (; nonlinear, vhat, what, bvhat, bwhat) = scratch
+    k1 = jac * N
+
+    exponential_nonlinearity!(nonlinear, q, equation)
+    bv = view(nonlinear, (0 * N + 1):(1 * N))
+    bw = view(nonlinear, (1 * N + 1):(2 * N))
+
+    mul!(vhat, rfft_plan, vold)
+    mul!(what, rfft_plan, wold)
+    mul!(bvhat, rfft_plan, bv)
+    mul!(bwhat, rfft_plan, bw)
+
+    @inbounds for j in eachindex(vhat, what, bvhat, bwhat)
+        theta = ((j - 1) * k1)^2 * dt
+        s, c = sincos(theta)
+        s2, c2 = sincos(2 * theta)
+        phis = iszero(theta) ? one(theta) : s / theta
+
+        vh = vhat[j]
+        wh = what[j]
+        bvh = bvhat[j]
+        bwh = bwhat[j]
+
+        linear_v = c2 * vh + s2 * wh
+        linear_w = c2 * wh - s2 * vh
+
+        # -2i dt exp(-i theta) phi_s(theta), phi_s(x) = sin(x) / x
+        ewi_re = -2 * dt * phis * s
+        ewi_im = -2 * dt * phis * c
+
+        vhat[j] = (linear_v + ewi_re * bvh - ewi_im * bwh) / N
+        what[j] = (linear_w + ewi_re * bwh + ewi_im * bvh) / N
+    end
+
+    mul!(vnew, brfft_plan, vhat)
+    mul!(wnew, brfft_plan, what)
+
+    return nothing
+end
+
 
 
 #####################################################################
@@ -770,7 +1050,13 @@ function setup(u_func, equation::CubicNLS, tspan, D2)
     dq1 = similar(q0)
     dq2 = similar(q0)
 
-    parameters = (; equation, D2, tmp1, dq1, dq2)
+    if D2 isa FourierPolynomialDerivativeOperator
+        # additional complex scratch buffer for `evolution_linear!`
+        tmp_complex = similar(D2.D1.tmp)
+        parameters = (; equation, D2, tmp1, tmp_complex, dq1, dq2)
+    else
+        parameters = (; equation, D2, tmp1, dq1, dq2)
+    end
     return (; q0, parameters)
 end
 
@@ -826,6 +1112,70 @@ function relaxation!(q, tmp, y, z, t, dt,
     @. z = (1 - gamma) * q + gamma * y
     q .= z .* sqrt(mass_old / mass(z, parameters))
     return t + gamma * dt
+end
+
+# Solve i u_t + β |u|^2 u = 0
+function evolution_nonlinear!(qnew, q, equation::CubicNLS, parameters, dt)
+    N = length(q) ÷ 2
+    v = view(q, (0 * N + 1):(1 * N))
+    w = view(q, (1 * N + 1):(2 * N))
+    vnew = view(qnew, (0 * N + 1):(1 * N))
+    wnew = view(qnew, (1 * N + 1):(2 * N))
+
+    factor = equation.β * dt
+    for i in eachindex(v, w, vnew, wnew)
+        v_i = v[i]
+        w_i = w[i]
+        s, c = sincos(factor * (v_i^2 + w_i^2))
+        vnew[i] = c * v_i - s * w_i
+        wnew[i] = s * v_i + c * w_i
+    end
+    return nothing
+end
+
+# Solve i u_t + u_xx = 0
+function evolution_linear!(qnew, q, equation::CubicNLS, parameters, dt)
+    (; D2) = parameters
+    N = size(D2, 2)
+
+    if !(D2 isa FourierPolynomialDerivativeOperator)
+        error("evolution_linear! is only implemented for a Fourier discretization, got $(typeof(D2))")
+    end
+
+    v = view(q, (0 * N + 1):(1 * N))
+    w = view(q, (1 * N + 1):(2 * N))
+    vnew = view(qnew, (0 * N + 1):(1 * N))
+    wnew = view(qnew, (1 * N + 1):(2 * N))
+
+    (; jac, tmp, rfft_plan, brfft_plan) = D2.D1
+    vhat = parameters.tmp_complex
+    what = tmp
+    k1 = jac * N # fundamental wavenumber
+
+    # u = v + i w evolves mode-wise as uhat(t + dt) = exp(-i k^2 dt) uhat(t),
+    # i.e., (vhat, what) gets rotated by the angle k^2 * dt:
+    #   vnew = Tc(v) + Ts(w),  wnew = Tc(w) - Ts(v)
+    # where Tc and Ts are the Fourier multipliers with symbols cos(k^2 dt)
+    # and sin(k^2 dt), respectively. We transform v and w to Fourier space
+    # once each, apply the rotation there, and transform the results back.
+
+    mul!(vhat, rfft_plan, v)
+    mul!(what, rfft_plan, w)
+
+    for j in eachindex(vhat, what)
+        s, c = sincos(((j - 1) * k1)^2 * dt)
+        vh = vhat[j]
+        wh = what[j]
+        # Divide by N to get the correct normalization for the
+        # inverse FFT later (since we use a brfft, not an ifft).
+        vhat[j] = (c * vh + s * wh) / N
+        what[j] = (c * wh - s * vh) / N
+    end
+
+    mul!(vnew, brfft_plan, vhat)
+    mul!(wnew, brfft_plan, what)
+
+    return nothing
 end
 
 one_soliton(t, x::Number, equation::CubicNLS) = cis(t) * sech(x)
@@ -1824,7 +2174,11 @@ function riemann_data(t, x::Number, equation::CubicNLS)
     rho_l = 2.0
     rho_r = 1.0
 
-    rho = 0.5 * (rho_l + rho_r) + 0.5 * (rho_r - rho_l) * tanh(100 * x)
+    if x < 0
+        rho = rho_l
+    else
+        rho = rho_r
+    end
     theta = 0.0
 
     return sqrt(rho) * cis(theta)
@@ -1915,6 +2269,70 @@ function dispersive_shock_wave(; alg = KenCarpARK548(),
 
 
     filename = joinpath(FIGDIR, "dispersive_shock_wave.pdf")
+    save(filename, fig)
+    @info "Results saved to $filename"
+    return nothing
+end
+
+function rarefaction_data(t, x::Number, equation::CubicNLS)
+    # Parameters of the dispersive Riemann problem from
+    # Deng-Shan Wang and Dinghao Zhu (2025)
+    # Asymptotic analysis for rarefaction problem of the focusing
+    # nonlinear Schrödinger equation with discrete spectrum
+    # https://doi.org/10.1007/s11005-025-01985-2
+    A = 1.0
+    # sqrt(2) to remove the factor 1/2 of their NLS
+    μ = 1.5 / sqrt(2)
+
+    return A * cis(μ * abs(x))
+end
+get_β(::typeof(rarefaction_data)) = 1
+
+function dispersive_rarefaction(; alg = KenCarpARK548(),
+                                  tspan = (0.0, 15.0),
+                                  dt = 0.05,
+                                  N = 2^14,
+                                  kwargs...)
+    fig = Figure(size = (1200, 350)) # default size is (600, 450)
+
+    @info "Dispersive rarefaction"
+    initial_condition = rarefaction_data
+    β = get_β(initial_condition)
+    equation = CubicNLS(β)
+    xmin = -400.0
+    xmax = +400.0
+    ax = Axis(fig[1, 1];
+              xlabel = L"$\xi = x / t$ at time $t = %$(round(Int, last(tspan)))$",
+              ylabel = L"Mass density $\varrho = |u|^2$")
+    D2 = fourier_derivative_operator(xmin, xmax, N)^2
+
+    (; q0, parameters) = setup(initial_condition, equation, tspan, D2)
+    @time sol = solve_imex(rhs_stiff!, operator(rhs_stiff!, parameters),
+                            rhs_nonstiff!,
+                            q0, tspan, parameters, alg;
+                            dt, kwargs...)
+
+    x = grid(D2)
+    # 120 ≈ 80 * sqrt(2) to remove the factor 1/2 of their NLS
+    idx = -120 .< x .< 120
+    xi = x[idx] / sol.t[end]
+    abs_u = density(sol.u[end], equation)[idx]
+    lines!(ax, xi, abs_u)
+    xlims!(ax, extrema(xi))
+
+
+    # Analytical results
+    A = 1.0
+    μ = 1.5
+    ξ1 = μ + 2 * sqrt(2A)
+    ξ2 = μ
+    # sqrt(2) to remove the factor 1/2 of their NLS
+    xticks = [-ξ1, -ξ2, ξ2, ξ1] * sqrt(2)
+    xticklabels = [L"-\xi_1", L"-\xi_2", L"\xi_2", L"\xi_1"]
+    ax.xticks = (xticks, xticklabels)
+
+
+    filename = joinpath(FIGDIR, "dispersive_rarefaction.pdf")
     save(filename, fig)
     @info "Results saved to $filename"
     return nothing
@@ -2320,6 +2738,159 @@ function error_growth(; alg = KenCarpARK548(),
     return nothing
 end
 
+function error_growth_others(; tspan = (0.0, 100.0),
+                               dt2 = 4.0e-3,
+                               N2 = 2^10,
+                               dt3 = 1.5e-3,
+                               N3 = 2^10,
+                               kwargs...)
+    # Initialization of physical parameters
+    xmin = -35.0
+    xmax = +35.0
+
+    fig = Figure(size = (1200, 750)) # default size is (600, 450)
+
+    function error_callback(initial_condition, mass0, energy0)
+        series_t = Vector{Float64}()
+        series_error = Vector{Float64}()
+        series_mass = Vector{Float64}()
+        series_energy = Vector{Float64}()
+        callback = let series_t = series_t,
+                       series_error = series_error,
+                       series_mass = series_mass,
+                       series_energy = series_energy,
+                       initial_condition = initial_condition,
+                       mass0 = mass0,
+                       energy0 = energy0
+            function (q, parameters, t)
+                p_tmp1 = parameters.tmp1
+                p_D2 = parameters.D2
+
+                push!(series_t, t)
+
+                v = real(q, parameters.equation)
+                w = imag(q, parameters.equation)
+
+                x = grid(p_D2)
+                for i in eachindex(x, p_tmp1)
+                    ic = initial_condition(t, x[i], parameters.equation)
+                    p_tmp1[i] = (v[i] - real(ic))^2 + (w[i] - imag(ic))^2
+                end
+                push!(series_error, sqrt(integrate(p_tmp1, p_D2)))
+
+                push!(series_mass, mass(q, parameters.equation, parameters) - mass0)
+                push!(series_energy, energy(q, parameters.equation, parameters) - energy0)
+
+                return nothing
+            end
+        end
+
+        return (; series_t, series_error, series_mass, series_energy, callback)
+    end
+
+    @info "Two solitons"
+    initial_condition = two_solitons
+    β = get_β(initial_condition)
+    equation = CubicNLS(β)
+    ax2 = Axis(fig[1, 1];
+               xlabel = L"Time $t$",
+               ylabel = L"Error at time $t$",
+               title = "Two solitons",
+               xscale = log10, yscale = log10)
+    ax2_invariants = Axis(fig[2, 1];
+                          xlabel = L"Time $t$",
+                          ylabel = "Change of invariants",
+                          xscale = log10)
+    D2 = fourier_derivative_operator(xmin, xmax, N2)^2
+    for (color_idx, method) in enumerate((:strang, :exponential))
+        label = method === :strang ? "Strang" : "Bao and Wang"
+        color = Cycled(color_idx)
+        @info label
+
+        (; q0, parameters) = setup(initial_condition, equation, tspan, D2)
+        mass0 = mass(q0, equation, parameters)
+        energy0 = energy(q0, equation, parameters)
+        (; series_t, series_error, series_mass, series_energy, callback) = error_callback(initial_condition, mass0, energy0)
+        if method === :strang
+            @time sol = solve_strang(evolution_nonlinear!, evolution_linear!,
+                                     q0, tspan, parameters;
+                                     dt = dt2, relaxation = NoProjection(),
+                                     callback, kwargs...)
+        else
+            @time sol = solve_exponential(q0, tspan, parameters;
+                                          dt = dt2, callback, kwargs...)
+        end
+        lines!(ax2, series_t, series_error; label, color)
+        lines!(ax2_invariants, series_t, series_mass;
+               label = label * ": mass", color)
+        lines!(ax2_invariants, series_t, series_energy;
+               label = label * ": energy", color)
+    end
+    t = [1.0, 1.0e2]
+    lines!(ax2, t, t .* 1.0e-3; label = L"\mathcal{O}(t)", linestyle = :dashdot, color = :gray)
+    axislegend(ax2; position = :rb, framevisible = false, nbanks = 1, colgap = 5)
+    axislegend(ax2_invariants; position = :lb, framevisible = false, nbanks = 1, colgap = 5)
+
+
+    @info "Three solitons"
+    initial_condition = three_solitons
+    β = get_β(initial_condition)
+    equation = CubicNLS(β)
+    ax3 = Axis(fig[1, 2];
+               xlabel = L"Time $t$",
+               ylabel = L"Error at time $t$",
+               title = "Three solitons",
+               xscale = log10, yscale = log10)
+    ax3_invariants = Axis(fig[2, 2];
+                          xlabel = L"Time $t$",
+                          ylabel = "Change of invariants",
+                          xscale = log10)
+    D2 = fourier_derivative_operator(xmin, xmax, N3)^2
+    for (color_idx, method) in enumerate((:strang, :exponential))
+        label = method === :strang ? "Strang" : "Bao and Wang"
+        color = Cycled(color_idx)
+        @info label
+
+        (; q0, parameters) = setup(initial_condition, equation, tspan, D2)
+        mass0 = mass(q0, equation, parameters)
+        energy0 = energy(q0, equation, parameters)
+        (; series_t, series_error, series_mass, series_energy, callback) = error_callback(initial_condition, mass0, energy0)
+        if method === :strang
+            @time sol = solve_strang(evolution_nonlinear!, evolution_linear!,
+                                     q0, tspan, parameters;
+                                     dt = dt3, relaxation = NoProjection(),
+                                     callback, kwargs...)
+        else
+            @time sol = solve_exponential(q0, tspan, parameters;
+                                          dt = dt3, callback, kwargs...)
+        end
+        lines!(ax3, series_t, series_error; label, color)
+        lines!(ax3_invariants, series_t, series_mass;
+               label = label * ": mass", color)
+        lines!(ax3_invariants, series_t, series_energy;
+               label = label * ": energy", color)
+    end
+    t = [1.0, 1.0e2]
+    lines!(ax3, t, t .* 1.0e-3; label = L"\mathcal{O}(t)", linestyle = :dashdot, color = :gray)
+    axislegend(ax3; position = :rb, framevisible = false, nbanks = 1, colgap = 5)
+    axislegend(ax3_invariants; position = :lb, framevisible = false, nbanks = 1, colgap = 5)
+
+
+    linkyaxes!(ax2, ax3)
+    hideydecorations!(ax3; grid = false, ticks = false, ticklabels = false)
+    hideydecorations!(ax3_invariants; grid = false, ticks = false, ticklabels = false)
+    linkxaxes!(ax2, ax2_invariants)
+    linkxaxes!(ax3, ax3_invariants)
+    hidexdecorations!(ax2; grid = false)
+    hidexdecorations!(ax3; grid = false)
+
+
+    filename = joinpath(FIGDIR, "error_growth_others.pdf")
+    save(filename, fig)
+    @info "Results saved to $filename"
+    return nothing
+end
+
 function gray_soliton(t, x::Number, equation::CubicNLS)
     # Parameters of the gray soliton
     b1 = 1.5
@@ -2507,6 +3078,55 @@ function solve_relaxation_crank_nicolson(; initial_condition = two_solitons,
 end
 
 # Helper function for the performance comparison
+function solve_strang_splitting(; initial_condition = two_solitons,
+                                  tspan = (0.0, 2.0),
+                                  dt = 5.0e-3,
+                                  D2 = fourier_derivative_operator(-35.0, 35.0, 2^10)^2)
+    β = get_β(initial_condition)
+    equation = CubicNLS(β)
+    (; q0, parameters) = setup(initial_condition, equation, tspan, D2)
+    runtime = @elapsed begin
+        sol = solve_strang(evolution_nonlinear!, evolution_linear!,
+                            q0, tspan, parameters;
+                            dt, relaxation = NoProjection())
+    end
+
+    # Compute error
+    x = grid(D2)
+    v = real(sol.u[end], equation)
+    w = imag(sol.u[end], equation)
+    tmp1 = (v .- real.(initial_condition.(sol.t[end], x, equation))).^2
+    tmp1 .= tmp1 .+ (w .- imag.(initial_condition.(sol.t[end], x, equation))).^2
+    final_error = sqrt(integrate(tmp1, D2))
+
+    return (; runtime, final_error)
+end
+
+# Helper function for the performance comparison
+function solve_exponential_integrator(; initial_condition = two_solitons,
+                                        tspan = (0.0, 2.0),
+                                        dt = 5.0e-3,
+                                        D2 = fourier_derivative_operator(-35.0, 35.0, 2^10)^2)
+    β = get_β(initial_condition)
+    equation = CubicNLS(β)
+    (; q0, parameters) = setup(initial_condition, equation, tspan, D2)
+    runtime = @elapsed begin
+        sol = solve_exponential(q0, tspan, parameters;
+                                dt)
+    end
+
+    # Compute error
+    x = grid(D2)
+    v = real(sol.u[end], equation)
+    w = imag(sol.u[end], equation)
+    tmp1 = (v .- real.(initial_condition.(sol.t[end], x, equation))).^2
+    tmp1 .= tmp1 .+ (w .- imag.(initial_condition.(sol.t[end], x, equation))).^2
+    final_error = sqrt(integrate(tmp1, D2))
+
+    return (; runtime, final_error)
+end
+
+# Helper function for the performance comparison
 function solve_geodesic_relaxation(; initial_condition = two_solitons,
                                      tspan = (0.0, 2.0),
                                      dt = 5.0e-3,
@@ -2577,7 +3197,7 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
                                           xmin, xmax, N = 2^11)
         errors = Float64[]
         runtimes = Float64[]
-        dts = 10.0 .^ range(log10(0.05), log10(0.00005), length = 6)
+        dts = 10.0 .^ range(log10(0.05), log10(0.0001), length = 6)
         @info "Besse et al., N = $(size(D2, 2)), $(length(dts) * num_trials) runs"
         for dt in dts
             t = Inf
@@ -2592,6 +3212,90 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
         end
         println()
         scatterlines!(ax2, runtimes, errors; label = L"Besse et al., FD, $N = %$(size(D2, 2))$")
+    end
+    let
+        sleep(0.1)
+        D2 = fourier_derivative_operator(xmin, xmax, 2^10)^2
+        errors = Float64[]
+        runtimes = Float64[]
+        dts = 10.0 .^ range(log10(0.01), log10(0.0001), length = 6)
+        @info "Strang splitting, N = $(size(D2, 2)), $(length(dts) * num_trials) runs"
+        for dt in dts
+            t = Inf
+            for trial in 1:num_trials
+                result = solve_strang_splitting(; initial_condition,
+                                                  tspan, dt, D2)
+                isone(trial) && push!(errors, result.final_error)
+                t = min(t, result.runtime)
+                print(".")
+            end
+            push!(runtimes, t)
+        end
+        println()
+        scatterlines!(ax2, runtimes, errors; label = L"Strang, Fourier, $N = %$(size(D2, 2))$")
+    end
+    let
+        sleep(0.1)
+        D2 = fourier_derivative_operator(xmin, xmax, 2^11)^2
+        errors = Float64[]
+        runtimes = Float64[]
+        dts = 10.0 .^ range(log10(0.01), log10(0.00005), length = 6)
+        @info "Strang splitting, N = $(size(D2, 2)), $(length(dts) * num_trials) runs"
+        for dt in dts
+            t = Inf
+            for trial in 1:num_trials
+                result = solve_strang_splitting(; initial_condition,
+                                                  tspan, dt, D2)
+                isone(trial) && push!(errors, result.final_error)
+                t = min(t, result.runtime)
+                print(".")
+            end
+            push!(runtimes, t)
+        end
+        println()
+        scatterlines!(ax2, runtimes, errors; label = L"Strang, Fourier, $N = %$(size(D2, 2))$")
+    end
+    let
+        sleep(0.1)
+        D2 = fourier_derivative_operator(xmin, xmax, 2^10)^2
+        errors = Float64[]
+        runtimes = Float64[]
+        dts = 10.0 .^ range(log10(0.01), log10(0.0001), length = 6)
+        @info "Bao and Wang exponential integrator, N = $(size(D2, 2)), $(length(dts) * num_trials) runs"
+        for dt in dts
+            t = Inf
+            for trial in 1:num_trials
+                result = solve_exponential_integrator(; initial_condition,
+                                                        tspan, dt, D2)
+                isone(trial) && push!(errors, result.final_error)
+                t = min(t, result.runtime)
+                print(".")
+            end
+            push!(runtimes, t)
+        end
+        println()
+        scatterlines!(ax2, runtimes, errors; label = L"Bao and Wang, Fourier, $N = %$(size(D2, 2))$")
+    end
+    let
+        sleep(0.1)
+        D2 = fourier_derivative_operator(xmin, xmax, 2^11)^2
+        errors = Float64[]
+        runtimes = Float64[]
+        dts = 10.0 .^ range(log10(0.01), log10(0.00005), length = 6)
+        @info "Bao and Wang exponential integrator, N = $(size(D2, 2)), $(length(dts) * num_trials) runs"
+        for dt in dts
+            t = Inf
+            for trial in 1:num_trials
+                result = solve_exponential_integrator(; initial_condition,
+                                                        tspan, dt, D2)
+                isone(trial) && push!(errors, result.final_error)
+                t = min(t, result.runtime)
+                print(".")
+            end
+            push!(runtimes, t)
+        end
+        println()
+        scatterlines!(ax2, runtimes, errors; label = L"Bao and Wang, Fourier, $N = %$(size(D2, 2))$")
     end
     let
         sleep(0.1)
@@ -2725,7 +3429,7 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
                                           xmin, xmax, N = 2^11)
         errors = Float64[]
         runtimes = Float64[]
-        dts = 10.0 .^ range(log10(0.05), log10(0.00005), length = 6)
+        dts = 10.0 .^ range(log10(0.05), log10(0.0001), length = 6)
         @info "Besse et al., N = $(size(D2, 2)), $(length(dts) * num_trials) runs"
         for dt in dts
             t = Inf
@@ -2740,6 +3444,90 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
         end
         println()
         scatterlines!(ax3, runtimes, errors; label = L"Besse et al., FD, $N = %$(size(D2, 2))$")
+    end
+    let
+        sleep(0.1)
+        D2 = fourier_derivative_operator(xmin, xmax, 2^10)^2
+        errors = Float64[]
+        runtimes = Float64[]
+        dts = 10.0 .^ range(log10(0.005), log10(0.00001), length = 6)
+        @info "Strang splitting, N = $(size(D2, 2)), $(length(dts) * num_trials) runs"
+        for dt in dts
+            t = Inf
+            for trial in 1:num_trials
+                result = solve_strang_splitting(; initial_condition,
+                                                  tspan, dt, D2)
+                isone(trial) && push!(errors, result.final_error)
+                t = min(t, result.runtime)
+                print(".")
+            end
+            push!(runtimes, t)
+        end
+        println()
+        scatterlines!(ax3, runtimes, errors; label = L"Strang, Fourier, $N = %$(size(D2, 2))$")
+    end
+    let
+        sleep(0.1)
+        D2 = fourier_derivative_operator(xmin, xmax, 2^11)^2
+        errors = Float64[]
+        runtimes = Float64[]
+        dts = 10.0 .^ range(log10(0.005), log10(0.00001), length = 6)
+        @info "Strang splitting, N = $(size(D2, 2)), $(length(dts) * num_trials) runs"
+        for dt in dts
+            t = Inf
+            for trial in 1:num_trials
+                result = solve_strang_splitting(; initial_condition,
+                                                  tspan, dt, D2)
+                isone(trial) && push!(errors, result.final_error)
+                t = min(t, result.runtime)
+                print(".")
+            end
+            push!(runtimes, t)
+        end
+        println()
+        scatterlines!(ax3, runtimes, errors; label = L"Strang, Fourier, $N = %$(size(D2, 2))$")
+    end
+    let
+        sleep(0.1)
+        D2 = fourier_derivative_operator(xmin, xmax, 2^10)^2
+        errors = Float64[]
+        runtimes = Float64[]
+        dts = 10.0 .^ range(log10(0.001), log10(0.00001), length = 6)
+        @info "Bao and Wang exponential integrator, N = $(size(D2, 2)), $(length(dts) * num_trials) runs"
+        for dt in dts
+            t = Inf
+            for trial in 1:num_trials
+                result = solve_exponential_integrator(; initial_condition,
+                                                        tspan, dt, D2)
+                isone(trial) && push!(errors, result.final_error)
+                t = min(t, result.runtime)
+                print(".")
+            end
+            push!(runtimes, t)
+        end
+        println()
+        scatterlines!(ax3, runtimes, errors; label = L"Bao and Wang, Fourier, $N = %$(size(D2, 2))$")
+    end
+    let
+        sleep(0.1)
+        D2 = fourier_derivative_operator(xmin, xmax, 2^11)^2
+        errors = Float64[]
+        runtimes = Float64[]
+        dts = 10.0 .^ range(log10(0.001), log10(0.00001), length = 6)
+        @info "Bao and Wang exponential integrator, N = $(size(D2, 2)), $(length(dts) * num_trials) runs"
+        for dt in dts
+            t = Inf
+            for trial in 1:num_trials
+                result = solve_exponential_integrator(; initial_condition,
+                                                        tspan, dt, D2)
+                isone(trial) && push!(errors, result.final_error)
+                t = min(t, result.runtime)
+                print(".")
+            end
+            push!(runtimes, t)
+        end
+        println()
+        scatterlines!(ax3, runtimes, errors; label = L"Bao and Wang, Fourier, $N = %$(size(D2, 2))$")
     end
     let
         sleep(0.1)

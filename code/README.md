@@ -18,11 +18,15 @@ julia> convergence_in_space() # this may take several minutes
 
 julia> dispersive_shock_wave()
 
+julia> dispersive_rarefaction()
+
 julia> fully_discrete_conservation()
 
 julia> convergence_in_time() # this may take a few minutes
 
 julia> error_growth()
+
+julia> error_growth_others()
 
 julia> error_growth_gray_soliton()
 
