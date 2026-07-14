@@ -42,7 +42,7 @@ We propose a class of numerical methods for the nonlinear Schrödinger (NLS) equ
 To reproduce the numerical experiments presented in this article, you need
 to install [Julia](https://julialang.org/).
 The numerical experiments presented in this article were performed using
-Julia v1.10.10.
+Julia v1.10.10 on a MacBook Pro (Apple M series).
 
 First, you need to download this repository, e.g., by cloning it with `git`
 or by downloading an archive via the GitHub interface. Then, you need to start

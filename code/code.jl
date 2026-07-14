@@ -3586,7 +3586,7 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
         alg = KenCarpARK548()
         errors = Float64[]
         runtimes = Float64[]
-        dts = 10.0 .^ range(log10(0.04), log10(0.001), length = 6)
+        dts = 10.0 .^ range(log10(0.01), log10(0.001), length = 6)
         @info "New method, N = $(size(D2, 2)), $(length(dts) * num_trials) runs"
         for dt in dts
             t = Inf
