@@ -34,6 +34,31 @@ if !isdir(FIGDIR)
     mkdir(FIGDIR)
 end
 
+# The NLS state stores its real and imaginary parts consecutively.  For odd N,
+# the second part is therefore not guaranteed to have the same SIMD alignment as
+# the first one. FFTW plans record the alignment of the array used for planning,
+# so plans without FFTW.UNALIGNED cannot in general be applied to both views.
+function fourier_derivative_operator_unaligned(xmin::Real, xmax::Real, N::Integer)
+    T = promote_type(typeof(xmin), typeof(xmax))
+    xmin_T, xmax_T = T(xmin), T(xmax)
+    jac = 2 * T(pi) / (xmax_T - xmin_T) / N
+    dx = (xmax_T - xmin_T) / N
+    grid_evaluate = range(xmin_T, stop = xmax_T, length = N + 1)
+    grid_compute = range(xmin_T, stop = grid_evaluate[end - 1], length = N)
+    u = zero.(grid_compute)
+    # The default flag of FFTW.jl is FFTW.ESTIMATE
+    flags = SummationByPartsOperators.FFTW.ESTIMATE
+    # We only need to take care of unaligned access for odd N
+    if isodd(N)
+        flags = flags | SummationByPartsOperators.FFTW.UNALIGNED
+    end
+    rfft_plan = SummationByPartsOperators.FFTW.plan_rfft(u; flags)
+    uhat = rfft_plan * u
+    brfft_plan = SummationByPartsOperators.FFTW.plan_brfft(uhat, N; flags)
+    return FourierDerivativeOperator(jac, dx, grid_compute, grid_evaluate,
+                                     uhat, rfft_plan, brfft_plan)
+end
+
 
 #####################################################################
 # Utility functions
@@ -1553,7 +1578,7 @@ function kinetic_energy_comparison(; tspan = (0.0, 5.0),
     fig = Figure(size = (1200, 400)) # default size is (600, 450)
 
     for (N, column) in ((2^6, 1), (2^6 + 1, 2))
-        D = fourier_derivative_operator(xmin, xmax, N)
+        D = fourier_derivative_operator_unaligned(xmin, xmax, N)
         D2 = D^2
 
         # Setup callback computing the error
@@ -2204,7 +2229,7 @@ function dispersive_shock_wave(; alg = KenCarpARK548(),
     ax_v = Axis(fig[2, 1];
                 xlabel = L"$\xi = x / t$ at time $t = %$(round(Int, last(tspan)))$",
                 ylabel = L"Velocity $v = \theta_x$")
-    D2 = fourier_derivative_operator(xmin, xmax, N)^2
+    D2 = fourier_derivative_operator_unaligned(xmin, xmax, N)^2
 
     (; q0, parameters) = setup(initial_condition, equation, tspan, D2)
     @time sol = solve_imex(rhs_stiff!, operator(rhs_stiff!, parameters),
@@ -2304,7 +2329,7 @@ function dispersive_rarefaction(; alg = KenCarpARK548(),
     ax = Axis(fig[1, 1];
               xlabel = L"$\xi = x / t$ at time $t = %$(round(Int, last(tspan)))$",
               ylabel = L"Mass density $\varrho = |u|^2$")
-    D2 = fourier_derivative_operator(xmin, xmax, N)^2
+    D2 = fourier_derivative_operator_unaligned(xmin, xmax, N)^2
 
     (; q0, parameters) = setup(initial_condition, equation, tspan, D2)
     @time sol = solve_imex(rhs_stiff!, operator(rhs_stiff!, parameters),
@@ -2354,7 +2379,7 @@ function fully_discrete_conservation(; tspan = (0.0, 4.3),
     β = get_β(initial_condition) # 2 n^2 for n solitons
     equation = CubicNLS(β)
 
-    D = fourier_derivative_operator(xmin, xmax, N)
+    D = fourier_derivative_operator_unaligned(xmin, xmax, N)
     D2 = D^2
 
     ax2_sol = Axis(fig[1, 1];
@@ -2422,7 +2447,7 @@ function fully_discrete_conservation(; tspan = (0.0, 4.3),
     β = get_β(initial_condition) # 2 n^2 for n solitons
     equation = CubicNLS(β)
 
-    D = fourier_derivative_operator(xmin, xmax, N)
+    D = fourier_derivative_operator_unaligned(xmin, xmax, N)
     D2 = D^2
 
     ax3_sol = Axis(fig[2, 1];
@@ -2524,7 +2549,7 @@ function convergence_in_time(; tspan = (0.0, 1.0),
                ylabel = L"Error at $t = %$(tspan[end])$",
                title = "Two solitons",
                xscale = log10, yscale = log10)
-    D2 = fourier_derivative_operator(xmin, xmax, 2^12)^2
+    D2 = fourier_derivative_operator_unaligned(xmin, xmax, 2^12)^2
     for (alg, alg_name) in algorithms
         @show alg_name
         for relaxation in (NoProjection(), FullRelaxation())
@@ -2571,7 +2596,7 @@ function convergence_in_time(; tspan = (0.0, 1.0),
                ylabel = L"Error at $t = %$(tspan[end])$",
                title = "Three solitons",
                xscale = log10, yscale = log10)
-    D2 = fourier_derivative_operator(xmin, xmax, 2^12)^2
+    D2 = fourier_derivative_operator_unaligned(xmin, xmax, 2^12)^2
     for (alg, alg_name) in algorithms
         @show alg_name
         for relaxation in (NoProjection(), FullRelaxation())
@@ -2641,7 +2666,7 @@ function error_growth(; alg = KenCarpARK548(),
                ylabel = L"Error at time $t$",
                title = "Two solitons",
                xscale = log10, yscale = log10)
-    D2 = fourier_derivative_operator(xmin, xmax, N2)^2
+    D2 = fourier_derivative_operator_unaligned(xmin, xmax, N2)^2
     for relaxation in (NoProjection(), FullRelaxation())
         @show relaxation
         series_t = Vector{Float64}()
@@ -2689,7 +2714,7 @@ function error_growth(; alg = KenCarpARK548(),
                ylabel = L"Error at time $t$",
                title = "Three solitons",
                xscale = log10, yscale = log10)
-    D2 = fourier_derivative_operator(xmin, xmax, N3)^2
+    D2 = fourier_derivative_operator_unaligned(xmin, xmax, N3)^2
     for relaxation in (NoProjection(), FullRelaxation())
         @show relaxation
         series_t = Vector{Float64}()
@@ -2801,7 +2826,7 @@ function error_growth_others(; tspan = (0.0, 100.0),
                           xlabel = L"Time $t$",
                           ylabel = "Change of invariants",
                           xscale = log10)
-    D2 = fourier_derivative_operator(xmin, xmax, N2)^2
+    D2 = fourier_derivative_operator_unaligned(xmin, xmax, N2)^2
     for (color_idx, method) in enumerate((:strang, :exponential))
         label = method === :strang ? "Strang" : "Bao and Wang"
         color = Cycled(color_idx)
@@ -2845,7 +2870,7 @@ function error_growth_others(; tspan = (0.0, 100.0),
                           xlabel = L"Time $t$",
                           ylabel = "Change of invariants",
                           xscale = log10)
-    D2 = fourier_derivative_operator(xmin, xmax, N3)^2
+    D2 = fourier_derivative_operator_unaligned(xmin, xmax, N3)^2
     for (color_idx, method) in enumerate((:strang, :exponential))
         label = method === :strang ? "Strang" : "Bao and Wang"
         color = Cycled(color_idx)
@@ -2951,7 +2976,7 @@ function error_growth_gray_soliton(; alg = KenCarpARK548(),
                    xlabel = L"Time $t$",
                    title = "Mass density error",
                    xscale = log10, yscale = log10)
-    D2 = fourier_derivative_operator(xmin, xmax, N)^2
+    D2 = fourier_derivative_operator_unaligned(xmin, xmax, N)^2
     for relaxation in (NoProjection(), FullRelaxation())
         @show relaxation
         series_t = Vector{Float64}()
@@ -3081,7 +3106,7 @@ end
 function solve_strang_splitting(; initial_condition = two_solitons,
                                   tspan = (0.0, 2.0),
                                   dt = 5.0e-3,
-                                  D2 = fourier_derivative_operator(-35.0, 35.0, 2^10)^2)
+                                  D2 = fourier_derivative_operator_unaligned(-35.0, 35.0, 2^10)^2)
     β = get_β(initial_condition)
     equation = CubicNLS(β)
     (; q0, parameters) = setup(initial_condition, equation, tspan, D2)
@@ -3106,7 +3131,7 @@ end
 function solve_exponential_integrator(; initial_condition = two_solitons,
                                         tspan = (0.0, 2.0),
                                         dt = 5.0e-3,
-                                        D2 = fourier_derivative_operator(-35.0, 35.0, 2^10)^2)
+                                        D2 = fourier_derivative_operator_unaligned(-35.0, 35.0, 2^10)^2)
     β = get_β(initial_condition)
     equation = CubicNLS(β)
     (; q0, parameters) = setup(initial_condition, equation, tspan, D2)
@@ -3215,7 +3240,7 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
     end
     let
         sleep(0.1)
-        D2 = fourier_derivative_operator(xmin, xmax, 2^10)^2
+        D2 = fourier_derivative_operator_unaligned(xmin, xmax, 2^10)^2
         errors = Float64[]
         runtimes = Float64[]
         dts = 10.0 .^ range(log10(0.01), log10(0.0001), length = 6)
@@ -3236,7 +3261,7 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
     end
     let
         sleep(0.1)
-        D2 = fourier_derivative_operator(xmin, xmax, 2^11)^2
+        D2 = fourier_derivative_operator_unaligned(xmin, xmax, 2^11)^2
         errors = Float64[]
         runtimes = Float64[]
         dts = 10.0 .^ range(log10(0.01), log10(0.00005), length = 6)
@@ -3257,7 +3282,7 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
     end
     let
         sleep(0.1)
-        D2 = fourier_derivative_operator(xmin, xmax, 2^10)^2
+        D2 = fourier_derivative_operator_unaligned(xmin, xmax, 2^10)^2
         errors = Float64[]
         runtimes = Float64[]
         dts = 10.0 .^ range(log10(0.01), log10(0.0001), length = 6)
@@ -3278,7 +3303,7 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
     end
     let
         sleep(0.1)
-        D2 = fourier_derivative_operator(xmin, xmax, 2^11)^2
+        D2 = fourier_derivative_operator_unaligned(xmin, xmax, 2^11)^2
         errors = Float64[]
         runtimes = Float64[]
         dts = 10.0 .^ range(log10(0.01), log10(0.00005), length = 6)
@@ -3347,7 +3372,7 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
     end
     let
         sleep(0.1)
-        D2 = fourier_derivative_operator(xmin, xmax, 2^10)^2
+        D2 = fourier_derivative_operator_unaligned(xmin, xmax, 2^10)^2
         alg = KenCarpARK548()
         errors = Float64[]
         runtimes = Float64[]
@@ -3369,7 +3394,7 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
     end
     let
         sleep(0.1)
-        D2 = fourier_derivative_operator(xmin, xmax, 2^11)^2
+        D2 = fourier_derivative_operator_unaligned(xmin, xmax, 2^11)^2
         alg = KenCarpARK548()
         errors = Float64[]
         runtimes = Float64[]
@@ -3447,7 +3472,7 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
     end
     let
         sleep(0.1)
-        D2 = fourier_derivative_operator(xmin, xmax, 2^10)^2
+        D2 = fourier_derivative_operator_unaligned(xmin, xmax, 2^10)^2
         errors = Float64[]
         runtimes = Float64[]
         dts = 10.0 .^ range(log10(0.005), log10(0.00001), length = 6)
@@ -3468,7 +3493,7 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
     end
     let
         sleep(0.1)
-        D2 = fourier_derivative_operator(xmin, xmax, 2^11)^2
+        D2 = fourier_derivative_operator_unaligned(xmin, xmax, 2^11)^2
         errors = Float64[]
         runtimes = Float64[]
         dts = 10.0 .^ range(log10(0.005), log10(0.00001), length = 6)
@@ -3489,7 +3514,7 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
     end
     let
         sleep(0.1)
-        D2 = fourier_derivative_operator(xmin, xmax, 2^10)^2
+        D2 = fourier_derivative_operator_unaligned(xmin, xmax, 2^10)^2
         errors = Float64[]
         runtimes = Float64[]
         dts = 10.0 .^ range(log10(0.001), log10(0.00001), length = 6)
@@ -3510,7 +3535,7 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
     end
     let
         sleep(0.1)
-        D2 = fourier_derivative_operator(xmin, xmax, 2^11)^2
+        D2 = fourier_derivative_operator_unaligned(xmin, xmax, 2^11)^2
         errors = Float64[]
         runtimes = Float64[]
         dts = 10.0 .^ range(log10(0.001), log10(0.00001), length = 6)
@@ -3579,7 +3604,7 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
     end
     let
         sleep(0.1)
-        D2 = fourier_derivative_operator(xmin, xmax, 2^10)^2
+        D2 = fourier_derivative_operator_unaligned(xmin, xmax, 2^10)^2
         alg = KenCarpARK548()
         errors = Float64[]
         runtimes = Float64[]
@@ -3601,7 +3626,7 @@ function performance_comparison(; num_trials = 3, tspan = (0.0, 2.0))
     end
     let
         sleep(0.1)
-        D2 = fourier_derivative_operator(xmin, xmax, 2^11)^2
+        D2 = fourier_derivative_operator_unaligned(xmin, xmax, 2^11)^2
         alg = KenCarpARK548()
         errors = Float64[]
         runtimes = Float64[]
@@ -3796,4 +3821,60 @@ function fully_discrete_conservation_hyperbolization(; tspan = (0.0, 4.3),
     save(filename, fig)
     @info "Results saved to $filename"
     return nothing
+end
+
+function run_single_simulation(; tspan = (0.0, 1.0),
+                                 alg = KenCarpARK548(),
+                                 dt = 0.01,
+                                 relaxation = NoProjection(),
+                                 N = 2^10,
+                                 kwargs...)
+    # Initialization of physical and numerical parameters
+    xmin = -40.0
+    xmax = +40.0
+    β = 2
+    function initial_condition(t, x, equation)
+        # this is a single moving soliton
+        return cis(-2x-3t) * sech(x+4t)
+    end
+
+
+    D = fourier_derivative_operator_unaligned(xmin, xmax, N)
+    D2 = D^2
+
+    equation = CubicNLS(β)
+    (; q0, parameters) = setup(initial_condition, equation, tspan, D2)
+    @time sol = solve_imex(rhs_stiff!, operator(rhs_stiff!, parameters),
+                           rhs_nonstiff!,
+                           q0, tspan, parameters, alg;
+                           dt, relaxation, kwargs...)
+
+    let
+        exact = initial_condition.(sol.t[end], grid(D2), equation)
+        exact_v = real.(exact)
+        exact_w = imag.(exact)
+        v = real(sol.u[end], equation)
+        w = imag(sol.u[end], equation)
+        diff_v = v - exact_v
+        diff_w = w - exact_w
+        l2_error = sqrt(integrate(abs2, diff_v, D2) +
+                        integrate(abs2, diff_w, D2))
+        h1_error = sqrt(integrate(abs2, diff_v, D2) -
+                        integrate(diff_v .* (D2 * diff_v), D2) +
+                        integrate(abs2, diff_w, D2) -
+                        integrate(diff_w .* (D2 * diff_w), D2))
+        @info "Errors at the final time" l2_error h1_error
+    end
+
+    fig = Figure(size = (600, 450)) # default size is (600, 450)
+
+    ax_sol = Axis(fig[1, 1]; xlabel = L"x", ylabel = L"Mass density $|u|^2$")
+    lines!(ax_sol, grid(D2), density(sol.u[begin], equation); label = "initial data")
+    lines!(ax_sol, grid(D2), density(sol.u[end], equation); label = "numerical solution")
+    lines!(ax_sol, grid(D2), abs2.(initial_condition.(tspan[end], grid(D2), equation));
+           label = "exact solution")
+    axislegend(ax_sol; position = :lt, framevisible = false)
+    xlims!(ax_sol, -8, 8)
+
+    return fig
 end
